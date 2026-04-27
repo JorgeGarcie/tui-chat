@@ -1,14 +1,63 @@
 import os
+import subprocess
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Input, Static
-from textual.containers import VerticalScroll
+from textual.widgets import Header, Footer, Input, Static, Markdown, OptionList, Label
+from textual.containers import VerticalScroll, Vertical
+from textual.screen import ModalScreen
 from textual.binding import Binding
 from textual.message import Message
 from textual import work
 
 from config import MODEL, OLLAMA_HOST
-from chat import stream_response, tool_result_message
+from chat import stream_response, tool_result_message, ensure_ollama_running, list_models
 from tools import execute_tool
+
+
+class ModelPicker(ModalScreen[str]):
+    """Modal for selecting an Ollama model."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    DEFAULT_CSS = """
+    ModelPicker {
+        align: center middle;
+    }
+    #picker-box {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #picker-current {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #picker-options {
+        height: auto;
+        max-height: 20;
+    }
+    """
+
+    def __init__(self, models: list[str], current: str) -> None:
+        super().__init__()
+        self.models = models
+        self.current = current
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="picker-box"):
+            yield Label(f"Current: {self.current}", id="picker-current")
+            yield Label("Pick a model (Esc to cancel):")
+            yield OptionList(*self.models, id="picker-options")
+
+    def on_mount(self) -> None:
+        self.query_one("#picker-options", OptionList).focus()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        self.dismiss(self.models[event.option_index])
 
 
 class StreamingMessage(Static):
@@ -46,6 +95,16 @@ class ChatApp(App):
         color: $success;
         margin-bottom: 1;
     }
+    .ai-label {
+        color: $success;
+        text-style: bold;
+        margin-bottom: 0;
+    }
+    Markdown {
+        margin-bottom: 1;
+        background: transparent;
+        padding: 0;
+    }
     """
 
     BINDINGS = [
@@ -72,6 +131,7 @@ class ChatApp(App):
         self.pending_tool = None
         self._streaming_widget = None
         self._streaming_text = ""
+        self.current_model = MODEL
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -86,7 +146,7 @@ class ChatApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.title = f"tui-chat | {MODEL}"
+        self.title = f"tui-chat | {self.current_model}"
         self.sub_title = f"{OLLAMA_HOST} | {os.getcwd()}"
         self.query_one("#input-box").focus()
 
@@ -107,6 +167,10 @@ class ChatApp(App):
 
         if self.pending_tool:
             await self._handle_tool_confirmation(text)
+            return
+
+        if text.startswith("/"):
+            self._handle_command(text)
             return
 
         self._add_message(f"[bold cyan]You:[/bold cyan] {text}", "user-msg")
@@ -137,15 +201,14 @@ class ChatApp(App):
     def on_chat_app_stream_done(self, event: StreamDone) -> None:
         """Handle stream completion."""
         if self._streaming_widget:
-            if event.display_text.strip():
-                self._streaming_widget.update(
-                    f"[bold green]AI:[/bold green] {event.display_text}"
-                )
-                self._streaming_widget.classes = "ai-msg"
-            else:
-                self._streaming_widget.remove()
+            self._streaming_widget.remove()
             self._streaming_widget = None
             self._streaming_text = ""
+            if event.display_text.strip():
+                scroll = self.query_one("#chat-scroll", VerticalScroll)
+                scroll.mount(Static("[bold green]AI:[/bold green]", classes="ai-label"))
+                scroll.mount(Markdown(event.display_text))
+                scroll.scroll_end(animate=False)
 
         if event.raw_text:
             self.messages.append(
@@ -169,7 +232,7 @@ class ChatApp(App):
         raw_text = ""
         tool_calls = []
 
-        for chunk in stream_response(self.messages):
+        for chunk in stream_response(self.messages, self.current_model):
             if chunk["type"] == "text":
                 display_text += chunk["content"]
                 self.post_message(self.TokenReceived(chunk["content"]))
@@ -207,6 +270,35 @@ class ChatApp(App):
         else:
             self._add_message("[dim]Skipped.[/dim]", "system-msg")
 
+    def _handle_command(self, text: str) -> None:
+        cmd = text.split(maxsplit=1)[0]
+        if cmd == "/model":
+            try:
+                models = list_models()
+            except Exception as e:
+                self._add_message(f"[red]Could not list models: {e}[/red]", "system-msg")
+                return
+            if not models:
+                self._add_message("[red]No models found.[/red]", "system-msg")
+                return
+
+            def picked(name: str | None) -> None:
+                if name and name != self.current_model:
+                    self.current_model = name
+                    self.title = f"tui-chat | {self.current_model}"
+                    self._add_message(f"[dim]Switched to {name}.[/dim]", "system-msg")
+
+            self.push_screen(ModelPicker(models, self.current_model), picked)
+        elif cmd == "/help":
+            self._add_message(
+                "[bold]Commands:[/bold]\n"
+                "  [cyan]/model[/cyan] — pick a different Ollama model\n"
+                "  [cyan]/help[/cyan]  — show this message",
+                "system-msg",
+            )
+        else:
+            self._add_message(f"[red]Unknown command: {cmd}[/red]", "system-msg")
+
     def action_clear(self) -> None:
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.remove_children()
@@ -217,5 +309,26 @@ class ChatApp(App):
 
 
 if __name__ == "__main__":
-    app = ChatApp()
-    app.run()
+    import sys
+
+    print(f"Checking Ollama at {OLLAMA_HOST}...", file=sys.stderr)
+    try:
+        ollama_proc = ensure_ollama_running(OLLAMA_HOST)
+    except RuntimeError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if ollama_proc:
+        print("Started ollama serve (logs: ~/.tui-chat/ollama.log)", file=sys.stderr)
+    else:
+        print("Ollama already running, attaching.", file=sys.stderr)
+
+    try:
+        ChatApp().run()
+    finally:
+        if ollama_proc:
+            ollama_proc.terminate()
+            try:
+                ollama_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ollama_proc.kill()

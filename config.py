@@ -1,7 +1,7 @@
 import os
 import platform
 
-OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11435")
+OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL = os.environ.get("TUI_MODEL", "qwen2.5-coder:32b")
 
 SYSTEM_PROMPT = f"""You are a helpful coding assistant running locally on the user's machine.
