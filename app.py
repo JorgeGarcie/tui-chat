@@ -1,16 +1,39 @@
 import os
 import subprocess
+from textual import events, work
 from textual.app import App, ComposeResult
-from textual.widgets import Header, Footer, Input, Static, Markdown, OptionList, Label
-from textual.containers import VerticalScroll, Vertical
-from textual.screen import ModalScreen
 from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
-from textual import work
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Footer,
+    Header,
+    Label,
+    Markdown,
+    OptionList,
+    Static,
+    TextArea,
+)
 
 from config import MODEL, OLLAMA_HOST
 from chat import stream_response, tool_result_message, ensure_ollama_running, list_models
 from tools import execute_tool
+
+
+class ChatTextArea(TextArea):
+    """TextArea that submits on Enter, lets Shift+Enter / paste insert newlines."""
+
+    class Submitted(Message):
+        def __init__(self, value: str) -> None:
+            super().__init__()
+            self.value = value
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            self.post_message(self.Submitted(self.text))
 
 
 class ModelPicker(ModalScreen[str]):
@@ -75,6 +98,9 @@ class ChatApp(App):
     #input-box {
         dock: bottom;
         margin-top: 1;
+        height: auto;
+        max-height: 8;
+        border: solid $primary;
     }
     .user-msg {
         color: $accent;
@@ -140,9 +166,9 @@ class ChatApp(App):
                 "[dim]Connected to " + MODEL + ". Start chatting.[/dim]",
                 classes="system-msg",
             )
-        yield Input(
-            placeholder="Type a message... (Ctrl+C to quit)", id="input-box"
-        )
+        text_area = ChatTextArea(id="input-box")
+        text_area.border_subtitle = "Enter to send · Shift+Enter for newline"
+        yield text_area
         yield Footer()
 
     def on_mount(self) -> None:
@@ -157,13 +183,15 @@ class ChatApp(App):
         scroll.scroll_end(animate=False)
         return widget
 
-    async def on_input_submitted(self, event: Input.Submitted) -> None:
+    async def on_chat_text_area_submitted(
+        self, event: ChatTextArea.Submitted
+    ) -> None:
         text = event.value.strip()
         if not text:
             return
 
-        input_box = self.query_one("#input-box", Input)
-        input_box.value = ""
+        input_box = self.query_one("#input-box", ChatTextArea)
+        input_box.text = ""
 
         if self.pending_tool:
             await self._handle_tool_confirmation(text)
@@ -224,7 +252,7 @@ class ChatApp(App):
                 f"Execute? (y/n)[/bold yellow]",
                 "tool-msg",
             )
-            self.query_one("#input-box", Input).focus()
+            self.query_one("#input-box", ChatTextArea).focus()
 
     @work(thread=True)
     def _stream_response(self) -> None:
