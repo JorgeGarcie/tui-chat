@@ -76,13 +76,20 @@ def ensure_ollama_running(host: str, max_wait: float = 10.0):
 
 TOOL_OPEN = "```tool_call"
 TOOL_CLOSE = "```"
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
 
 
-def _safe_split(buf: str) -> tuple[str, str]:
-    """Return (yield_now, hold_back) so we never emit a partial '```tool_call' fence."""
-    for i in range(min(len(TOOL_OPEN) - 1, len(buf)), 0, -1):
-        if buf.endswith(TOOL_OPEN[:i]):
-            return buf[:-i], buf[-i:]
+def _safe_split_multi(buf: str, prefixes) -> tuple[str, str]:
+    """Hold back the longest partial-fence suffix against any of `prefixes`."""
+    max_hold = 0
+    for prefix in prefixes:
+        for i in range(min(len(prefix) - 1, len(buf)), 0, -1):
+            if buf.endswith(prefix[:i]):
+                max_hold = max(max_hold, i)
+                break
+    if max_hold:
+        return buf[:-max_hold], buf[-max_hold:]
     return buf, ""
 
 
@@ -103,10 +110,12 @@ def list_models() -> list[str]:
 
 
 def stream_response(messages: list, model: str = MODEL):
-    """Stream a chat response from Ollama, parsing <tool_call> tags out of the text.
+    """Stream a chat response, parsing ```tool_call``` and <think> blocks.
 
     Yields:
         {"type": "text", "content": "..."}                  — visible token
+        {"type": "thinking", "content": "..."}              — chunk of reasoning (live)
+        {"type": "thinking_end"}                            — end of </think> block
         {"type": "tool_call", "name": "...", "args": {...}} — parsed tool request
         {"type": "assistant_raw", "content": "..."}         — full raw output (for history)
         {"type": "done"}
@@ -122,9 +131,10 @@ def stream_response(messages: list, model: str = MODEL):
         return
 
     raw = ""
-    pending = ""        # buffer of streamed text not yet yielded as visible "text"
-    tool_buf = ""       # buffer of content inside an open <tool_call>...
-    in_tool = False
+    pending = ""       # text-state accumulator
+    tool_buf = ""      # tool-state JSON accumulator
+    think_buf = ""     # think-state partial-close accumulator
+    state = "text"     # one of: "text", "tool", "think"
 
     for chunk in stream:
         content = chunk.get("message", {}).get("content", "")
@@ -134,13 +144,13 @@ def stream_response(messages: list, model: str = MODEL):
 
         cursor = content
         while cursor:
-            if in_tool:
-                end = (tool_buf + cursor).find(TOOL_CLOSE)
+            if state == "tool":
+                combined = tool_buf + cursor
+                end = combined.find(TOOL_CLOSE)
                 if end == -1:
-                    tool_buf += cursor
+                    tool_buf = combined
                     cursor = ""
                 else:
-                    combined = tool_buf + cursor
                     json_str = combined[:end].strip()
                     try:
                         tc = json.loads(json_str)
@@ -153,27 +163,58 @@ def stream_response(messages: list, model: str = MODEL):
                         yield {"type": "text", "content": f"\n[bad tool_call JSON: {e}]\n"}
                     cursor = combined[end + len(TOOL_CLOSE):]
                     tool_buf = ""
-                    in_tool = False
-            else:
+                    state = "text"
+
+            elif state == "think":
+                combined = think_buf + cursor
+                end = combined.find(THINK_CLOSE)
+                if end == -1:
+                    safe, hold = _safe_split_multi(combined, [THINK_CLOSE])
+                    if safe:
+                        yield {"type": "thinking", "content": safe}
+                    think_buf = hold
+                    cursor = ""
+                else:
+                    if end > 0:
+                        yield {"type": "thinking", "content": combined[:end]}
+                    yield {"type": "thinking_end"}
+                    cursor = combined[end + len(THINK_CLOSE):]
+                    think_buf = ""
+                    state = "text"
+
+            else:  # state == "text"
                 pending += cursor
                 cursor = ""
-                start = pending.find(TOOL_OPEN)
-                if start != -1:
-                    if start > 0:
-                        yield {"type": "text", "content": pending[:start]}
-                    cursor = pending[start + len(TOOL_OPEN):]
-                    pending = ""
-                    in_tool = True
-                else:
-                    safe, hold = _safe_split(pending)
+                tool_idx = pending.find(TOOL_OPEN)
+                think_idx = pending.find(THINK_OPEN)
+
+                candidates = []
+                if tool_idx != -1:
+                    candidates.append((tool_idx, "tool", len(TOOL_OPEN)))
+                if think_idx != -1:
+                    candidates.append((think_idx, "think", len(THINK_OPEN)))
+
+                if not candidates:
+                    safe, hold = _safe_split_multi(pending, [TOOL_OPEN, THINK_OPEN])
                     if safe:
                         yield {"type": "text", "content": safe}
                     pending = hold
+                else:
+                    idx, kind, open_len = min(candidates)
+                    if idx > 0:
+                        yield {"type": "text", "content": pending[:idx]}
+                    cursor = pending[idx + open_len:]
+                    pending = ""
+                    state = kind
 
     if pending:
         yield {"type": "text", "content": pending}
-    if in_tool and tool_buf:
+    if state == "tool" and tool_buf:
         yield {"type": "text", "content": f"\n[unterminated tool_call: {tool_buf}]\n"}
+    if state == "think":
+        if think_buf:
+            yield {"type": "thinking", "content": think_buf}
+        yield {"type": "thinking_end"}
 
     yield {"type": "assistant_raw", "content": raw}
     yield {"type": "done"}
