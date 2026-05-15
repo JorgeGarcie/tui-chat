@@ -1,6 +1,14 @@
 import ast
+import os
 import re
 import subprocess
+
+
+_read_paths: set[str] = set()
+
+
+def clear_read_tracker() -> None:
+    _read_paths.clear()
 
 
 TOOL_DEFINITIONS = [
@@ -138,6 +146,7 @@ def _read_file(path: str, start_line=None, end_line=None) -> str:
     except Exception as e:
         return f"[error: {e}]"
 
+    _read_paths.add(os.path.abspath(path))
     start = max(0, int(start_line or 1) - 1)
     end = int(end_line) if end_line else len(lines)
     numbered = [f"L{i}: {ln.rstrip()}" for i, ln in enumerate(lines[start:end], start=start + 1)]
@@ -180,6 +189,11 @@ def _outline(path: str) -> str:
 
 
 def _edit_file(path: str, old: str, new: str) -> str:
+    if os.path.abspath(path) not in _read_paths:
+        return (
+            f"[error: must read_file {path} before edit_file. "
+            f"Call read_file first to verify the content you want to change.]"
+        )
     try:
         with open(path) as f:
             content = f.read()
@@ -207,6 +221,11 @@ def _edit_file(path: str, old: str, new: str) -> str:
 
 
 def _write_file(path: str, content: str) -> str:
+    if os.path.exists(path) and os.path.abspath(path) not in _read_paths:
+        return (
+            f"[error: must read_file {path} before write_file. "
+            f"Call read_file first to verify the content you want to change.]"
+        )
     try:
         with open(path, "w") as f:
             n = f.write(content)
