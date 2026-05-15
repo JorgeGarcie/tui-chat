@@ -25,16 +25,93 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file on the user's machine.",
+            "description": "Read the contents of a file, optionally a line range.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative path to the file",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "1-indexed first line to read (inclusive)",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "1-indexed last line to read (inclusive)",
+                    },
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "outline",
+            "description": "Structural view of a Python file: imports, classes, def signatures with line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path to a .py file",
                     }
                 },
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Regex search within a single file; returns matching lines with line numbers.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Python regex pattern",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path to the file to search",
+                    },
+                },
+                "required": ["pattern", "path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace the exact string `old` with `new` in `path`. `old` must occur exactly once.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "old": {"type": "string", "description": "Literal string to find (must be unique in the file)"},
+                    "new": {"type": "string", "description": "Replacement string"},
+                },
+                "required": ["path", "old", "new"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Overwrite `path` with `content`. Use for new files or full rewrites; prefer edit_file for changes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file"},
+                    "content": {"type": "string", "description": "Full file contents to write"},
+                },
+                "required": ["path", "content"],
             },
         },
     },
