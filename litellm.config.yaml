@@ -1,0 +1,6 @@
+model_list:
+  - model_name: qwen3-coder-next
+    litellm_params:
+      model: openai/cyankiwi/Qwen3-Coder-Next-AWQ-4bit
+      api_base: http://localhost:8765/v1
+      api_key: dummy
