@@ -138,11 +138,10 @@ def _read_file(path: str, start_line=None, end_line=None) -> str:
     except Exception as e:
         return f"[error: {e}]"
 
-    if start_line is None and end_line is None:
-        return "".join(lines)[:50_000]  # cap full reads at 50KB
     start = max(0, int(start_line or 1) - 1)
     end = int(end_line) if end_line else len(lines)
-    return "".join(lines[start:end])[:50_000]
+    numbered = [f"L{i}: {ln.rstrip()}" for i, ln in enumerate(lines[start:end], start=start + 1)]
+    return "\n".join(numbered)[:50_000]  # cap reads at 50KB
 
 
 def _outline(path: str) -> str:
