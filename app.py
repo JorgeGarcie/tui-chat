@@ -1,5 +1,8 @@
+#
 import os
+import re
 import subprocess
+from datetime import datetime
 from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -43,9 +46,16 @@ PHOSPHOR_THEME = Theme(
 
 USER_PROMPT = ">"
 
-from config import MODEL, OLLAMA_HOST
-from chat import stream_response, tool_result_message, ensure_ollama_running, list_models
-from tools import execute_tool
+from config import BACKEND, MODEL, OLLAMA_HOST
+from chat import (
+    compact_messages,
+    ensure_ollama_running,
+    list_models,
+    stream_response,
+    tool_result_message,
+)
+from sessions import list_sessions, load_session, save_session
+from tools import execute_tool, is_safe
 
 
 class ChatTextArea(TextArea):
@@ -61,6 +71,49 @@ class ChatTextArea(TextArea):
             event.prevent_default()
             event.stop()
             self.post_message(self.Submitted(self.text))
+
+
+class SessionPicker(ModalScreen[str]):
+    """Modal for selecting a saved session."""
+
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    DEFAULT_CSS = """
+    SessionPicker { align: center middle; }
+    #session-box {
+        width: 80;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #session-options {
+        height: auto;
+        max-height: 25;
+    }
+    """
+
+    def __init__(self, sessions: list) -> None:
+        super().__init__()
+        self.sessions = sessions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="session-box"):
+            yield Label("Pick a session (Esc to cancel):")
+            options = [
+                f"{s['id']}  ·  {s['model']}  ·  {s['count']}msg  ·  {s['preview']}"
+                for s in self.sessions
+            ]
+            yield OptionList(*options, id="session-options")
+
+    def on_mount(self) -> None:
+        self.query_one("#session-options", OptionList).focus()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        self.dismiss(self.sessions[event.option_index]["id"])
 
 
 class ModelPicker(ModalScreen[str]):
@@ -257,6 +310,12 @@ class ChatApp(App):
     class ThinkingEnd(Message):
         pass
 
+    class Stats(Message):
+        def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+            super().__init__()
+            self.prompt_tokens = prompt_tokens
+            self.completion_tokens = completion_tokens
+
     def __init__(self):
         super().__init__()
         self.messages = []
@@ -269,6 +328,8 @@ class ChatApp(App):
         self._thinking_static = None
         self._thinking_text = ""
         self._thinking_active = False
+        self._context_tokens = 0
+        self.session_id = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -290,7 +351,11 @@ class ChatApp(App):
         self.query_one("#input-box").focus()
 
     def _update_title(self) -> None:
-        self.title = f"tui-chat | {self.current_model} | ● connected"
+        if self._context_tokens >= 1000:
+            tok = f"{self._context_tokens / 1000:.1f}k"
+        else:
+            tok = str(self._context_tokens)
+        self.title = f"tui-chat | {self.current_model} | ● {tok} tokens"
 
     def _add_message(self, markup: str, css_class: str) -> Static:
         scroll = self.query_one("#chat-scroll", VerticalScroll)
@@ -368,6 +433,10 @@ class ChatApp(App):
         self._thinking_static.update(self._thinking_text)
         self.query_one("#chat-scroll", VerticalScroll).scroll_end(animate=False)
 
+    def on_chat_app_stats(self, event: Stats) -> None:
+        self._context_tokens = event.prompt_tokens + event.completion_tokens
+        self._update_title()
+
     def on_chat_app_thinking_end(self, event: ThinkingEnd) -> None:
         if self._thinking_widget is not None:
             n_lines = len(self._thinking_text.splitlines()) or 1
@@ -404,6 +473,10 @@ class ChatApp(App):
             self.messages.append(
                 {"role": "assistant", "content": event.raw_text}
             )
+            try:
+                save_session(self.session_id, self.current_model, self.messages)
+            except Exception as e:
+                self._add_message(f"[autosave failed: {e}]", "system-msg")
 
         # reset thinking refs so the next turn creates a fresh widget
         self._thinking_widget = None
@@ -413,14 +486,17 @@ class ChatApp(App):
 
         if event.tool_calls:
             tc = event.tool_calls[0]
-            self.pending_tool = tc
-            args_str = ", ".join(f"{k}={v!r}" for k, v in tc["args"].items())
-            self._add_message(
-                f"[bold yellow]Tool: {tc['name']}({args_str})\n"
-                f"Execute? (y/n)[/bold yellow]",
-                "tool-msg",
-            )
-            self.query_one("#input-box", ChatTextArea).focus()
+            if is_safe(tc["name"], tc["args"]):
+                self._auto_run_tool(tc)
+            else:
+                self.pending_tool = tc
+                args_str = ", ".join(f"{k}={v!r}" for k, v in tc["args"].items())
+                self._add_message(
+                    f"[bold yellow]Tool: {tc['name']}({args_str})\n"
+                    f"Execute? (y/n)[/bold yellow]",
+                    "tool-msg",
+                )
+                self.query_one("#input-box", ChatTextArea).focus()
 
     @work(thread=True)
     def _stream_response(self) -> None:
@@ -444,6 +520,10 @@ class ChatApp(App):
                 self.post_message(self.ThinkingEnd())
             elif ctype == "tool_call":
                 tool_calls.append(chunk)
+            elif ctype == "stats":
+                self.post_message(self.Stats(
+                    chunk["prompt_tokens"], chunk["completion_tokens"]
+                ))
             elif ctype == "assistant_raw":
                 raw_text = chunk["content"]
             elif ctype == "done":
@@ -494,15 +574,118 @@ class ChatApp(App):
                     self._add_message(f"[dim]Switched to {name}.[/dim]", "system-msg")
 
             self.push_screen(ModelPicker(models, self.current_model), picked)
+        elif cmd == "/save":
+            parts = text.split(maxsplit=1)
+            new_id = parts[1].strip() if len(parts) > 1 else self.session_id
+            try:
+                path = save_session(new_id, self.current_model, self.messages)
+                self.session_id = new_id
+                self._add_message(f"Saved to {path}", "system-msg")
+            except Exception as e:
+                self._add_message(f"Save failed: {e}", "system-msg")
+        elif cmd == "/load":
+            sessions = list_sessions()
+            if not sessions:
+                self._add_message("No saved sessions.", "system-msg")
+                return
+
+            def picked(sid: str | None) -> None:
+                if not sid:
+                    return
+                data = load_session(sid)
+                if not data:
+                    self._add_message(f"Session {sid} not found.", "system-msg")
+                    return
+                self.session_id = sid
+                self.messages = list(data.get("messages", []))
+                self._context_tokens = 0
+                self._update_title()
+                self._replay_messages(self.messages)
+                self._add_message(f"Loaded {sid} ({len(self.messages)} msgs).", "system-msg")
+
+            self.push_screen(SessionPicker(sessions), picked)
+        elif cmd == "/compact":
+            if len(self.messages) < 6:
+                self._add_message("Not enough history to compact.", "system-msg")
+                return
+            self._add_message("Compacting…", "system-msg")
+            self._compact_worker()
         elif cmd == "/help":
             self._add_message(
                 "[bold]Commands:[/bold]\n"
-                "  [cyan]/model[/cyan] — pick a different Ollama model\n"
-                "  [cyan]/help[/cyan]  — show this message",
+                "  [cyan]/model[/cyan]   — pick a different Ollama model\n"
+                "  [cyan]/save[/cyan] [name] — save current session\n"
+                "  [cyan]/load[/cyan]    — load a saved session\n"
+                "  [cyan]/compact[/cyan] — summarize old turns to free context\n"
+                "  [cyan]/help[/cyan]    — show this message",
                 "system-msg",
             )
         else:
             self._add_message(f"[red]Unknown command: {cmd}[/red]", "system-msg")
+
+    def _auto_run_tool(self, tc: dict) -> None:
+        """Execute a safe tool call without prompting."""
+        args_str = ", ".join(f"{k}={v!r}" for k, v in tc["args"].items())
+        self._add_message(
+            f"[dim]auto-run {tc['name']}({args_str})[/dim]", "system-msg"
+        )
+        result = execute_tool(tc["name"], tc["args"])
+        self._show_tool_result(tc["name"], tc["args"], result)
+        self.messages.append(tool_result_message(tc["name"], result))
+
+        self._streaming_text = ""
+        self._streaming_widget = StreamingMessage("thinking", classes="streaming")
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll.mount(self._streaming_widget)
+        scroll.scroll_end(animate=False)
+        self._stream_response()
+
+    def _replay_messages(self, messages: list) -> None:
+        """Re-render a loaded conversation into the chat scroll."""
+        scroll = self.query_one("#chat-scroll", VerticalScroll)
+        scroll.remove_children()
+        for m in messages:
+            content = m.get("content", "")
+            role = m.get("role", "")
+            if content.startswith("<tool_result"):
+                continue
+            if role == "user":
+                if content.startswith("[Summary of earlier conversation]"):
+                    scroll.mount(Static(content, classes="system-msg"))
+                else:
+                    scroll.mount(Static(f"{USER_PROMPT} {content}", classes="user-msg"))
+            elif role == "assistant":
+                display = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL)
+                display = re.sub(r"```tool_call.*?```", "", display, flags=re.DOTALL)
+                display = display.strip()
+                if display:
+                    scroll.mount(Markdown(display))
+        scroll.scroll_end(animate=False)
+
+    @work(thread=True)
+    def _compact_worker(self) -> None:
+        try:
+            new_messages, summary = compact_messages(self.messages, self.current_model)
+        except Exception as e:
+            self.call_from_thread(
+                self._add_message, f"Compact failed: {e}", "system-msg"
+            )
+            return
+        self.call_from_thread(self._apply_compact, new_messages, summary)
+
+    def _apply_compact(self, new_messages: list, summary: str) -> None:
+        before = len(self.messages)
+        self.messages = new_messages
+        self._context_tokens = 0
+        self._update_title()
+        self._add_message(
+            f"Compacted {before} → {len(new_messages)} messages.",
+            "system-msg",
+        )
+        try:
+            save_session(self.session_id, self.current_model, self.messages)
+        except Exception:
+            pass
 
     def action_cancel(self) -> None:
         if self._streaming_widget is not None:
@@ -512,6 +695,8 @@ class ChatApp(App):
         scroll = self.query_one("#chat-scroll", VerticalScroll)
         scroll.remove_children()
         self.messages.clear()
+        self._context_tokens = 0
+        self._update_title()
         scroll.mount(
             Static("[dim]Chat cleared.[/dim]", classes="system-msg")
         )
@@ -520,17 +705,21 @@ class ChatApp(App):
 if __name__ == "__main__":
     import sys
 
-    print(f"Checking Ollama at {OLLAMA_HOST}...", file=sys.stderr)
-    try:
-        ollama_proc = ensure_ollama_running(OLLAMA_HOST)
-    except RuntimeError as e:
-        print(f"error: {e}", file=sys.stderr)
-        sys.exit(1)
+    ollama_proc = None
+    if BACKEND == "ollama":
+        print(f"Checking Ollama at {OLLAMA_HOST}...", file=sys.stderr)
+        try:
+            ollama_proc = ensure_ollama_running(OLLAMA_HOST)
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(1)
 
-    if ollama_proc:
-        print("Started ollama serve (logs: ~/.tui-chat/ollama.log)", file=sys.stderr)
+        if ollama_proc:
+            print("Started ollama serve (logs: ~/.tui-chat/ollama.log)", file=sys.stderr)
+        else:
+            print("Ollama already running, attaching.", file=sys.stderr)
     else:
-        print("Ollama already running, attaching.", file=sys.stderr)
+        print(f"Using OpenAI-compatible backend ({BACKEND}).", file=sys.stderr)
 
     try:
         ChatApp().run()
@@ -541,3 +730,4 @@ if __name__ == "__main__":
                 ollama_proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ollama_proc.kill()
+#

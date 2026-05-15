@@ -7,11 +7,35 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from ollama import Client
-from config import OLLAMA_HOST, MODEL, SYSTEM_PROMPT
+from config import (
+    BACKEND, OLLAMA_HOST, OPENAI_BASE_URL, OPENAI_API_KEY,
+    MODEL, NUM_CTX, SYSTEM_PROMPT,
+)
 
 
-client = Client(host=OLLAMA_HOST)
+if BACKEND == "openai":
+    from openai import OpenAI
+    client = OpenAI(base_url=OPENAI_BASE_URL, api_key=OPENAI_API_KEY)
+else:
+    from ollama import Client
+    client = Client(host=OLLAMA_HOST)
+
+
+def _openai_to_ollama(stream):
+    """Adapt OpenAI streaming chunks into the ollama chunk shape that stream_response expects."""
+    for chunk in stream:
+        out = {"message": {"content": ""}}
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            out["message"]["content"] = delta.content or ""
+            if chunk.choices[0].finish_reason:
+                out["done"] = True
+        usage = getattr(chunk, "usage", None)
+        if usage:
+            out["done"] = True
+            out["prompt_eval_count"] = usage.prompt_tokens
+            out["eval_count"] = usage.completion_tokens
+        yield out
 
 
 def _ollama_alive(host: str, timeout: float = 0.5) -> bool:
@@ -95,6 +119,11 @@ def _safe_split_multi(buf: str, prefixes) -> tuple[str, str]:
 
 def list_models() -> list[str]:
     """Return a sorted list of locally available model names."""
+    if BACKEND == "openai":
+        try:
+            return sorted(m.id for m in client.models.list().data)
+        except Exception:
+            return []
     resp = client.list()
     raw = getattr(resp, "models", None)
     if raw is None:
@@ -123,7 +152,22 @@ def stream_response(messages: list, model: str = MODEL):
     full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 
     try:
-        stream = client.chat(model=model, messages=full_messages, stream=True)
+        if BACKEND == "openai":
+            raw_stream = client.chat.completions.create(
+                model=model,
+                messages=full_messages,
+                stream=True,
+                stream_options={"include_usage": True},
+                max_tokens=4096,
+            )
+            stream = _openai_to_ollama(raw_stream)
+        else:
+            stream = client.chat(
+                model=model,
+                messages=full_messages,
+                stream=True,
+                options={"num_ctx": NUM_CTX},
+            )
     except Exception as e:
         yield {"type": "text", "content": f"[Connection error: {e}]"}
         yield {"type": "assistant_raw", "content": ""}
@@ -135,8 +179,11 @@ def stream_response(messages: list, model: str = MODEL):
     tool_buf = ""      # tool-state JSON accumulator
     think_buf = ""     # think-state partial-close accumulator
     state = "text"     # one of: "text", "tool", "think"
+    final_stats = None
 
     for chunk in stream:
+        if chunk.get("done"):
+            final_stats = chunk
         content = chunk.get("message", {}).get("content", "")
         if not content:
             continue
@@ -216,8 +263,50 @@ def stream_response(messages: list, model: str = MODEL):
             yield {"type": "thinking", "content": think_buf}
         yield {"type": "thinking_end"}
 
+    if final_stats is not None:
+        yield {
+            "type": "stats",
+            "prompt_tokens": final_stats.get("prompt_eval_count", 0),
+            "completion_tokens": final_stats.get("eval_count", 0),
+        }
     yield {"type": "assistant_raw", "content": raw}
     yield {"type": "done"}
+
+
+def compact_messages(messages: list, model: str, keep_last_n: int = 4) -> tuple[list, str]:
+    """Summarize all but the last N messages. Returns (new_messages, summary)."""
+    if len(messages) <= keep_last_n + 2:
+        return messages, ""
+
+    to_summarize = messages[:-keep_last_n]
+    keep = messages[-keep_last_n:]
+
+    transcript = "\n\n".join(
+        f"[{m['role'].upper()}]: {m.get('content', '')}" for m in to_summarize
+    )
+    summary_messages = [
+        {"role": "system", "content":
+            "Summarize the conversation below in 5-8 sentences. "
+            "Preserve key facts, decisions, code identifiers, file paths, "
+            "and open questions. No commentary, no headings."},
+        {"role": "user", "content": transcript},
+    ]
+    if BACKEND == "openai":
+        resp = client.chat.completions.create(
+            model=model, messages=summary_messages, stream=False,
+        )
+        summary = resp.choices[0].message.content.strip()
+    else:
+        resp = client.chat(
+            model=model, messages=summary_messages, stream=False,
+            options={"num_ctx": NUM_CTX},
+        )
+        summary = resp["message"]["content"].strip()
+    new_messages = [
+        {"role": "user", "content": f"[Summary of earlier conversation]\n{summary}"},
+        *keep,
+    ]
+    return new_messages, summary
 
 
 def tool_result_message(name: str, result: str) -> dict:

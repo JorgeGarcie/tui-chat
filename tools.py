@@ -41,6 +41,55 @@ TOOL_DEFINITIONS = [
 ]
 
 
+SAFE_TOOLS = {"read_file", "outline", "grep"}
+
+SAFE_COMMAND_PREFIXES = (
+    "ls", "pwd", "whoami", "date", "echo", "printf",
+    "cat", "head", "tail",
+    "wc", "du", "df", "tree", "stat", "file", "which",
+    "ps",
+    "git status", "git log", "git diff", "git show",
+    "git branch", "git remote",
+)
+
+DANGEROUS_PATTERNS = (
+    r"\brm\b", r"\bmv\b", r"\bdd\b", r"\bmkfs\b",
+    r"\bchmod\b", r"\bchown\b",
+    r"\bsudo\b", r"\bsu\s",
+    r">\s", r">>\s",  # any output redirect
+    r"\bgit\s+(push|reset|clean|rebase|checkout\s+--|filter-branch)\b",
+    r"\bkill\b", r"\bpkill\b",
+    r"\bapt(?:-get)?\b\s+(install|remove|purge|upgrade)",
+    r"\bpip\b\s+(install|uninstall)",
+    r"\bnpm\b\s+(install|uninstall)",
+    r"\bcurl\b.*\|",
+    r"\bwget\b.*\|",
+    r"&&|;|\|\|",  # any chaining — be conservative
+)
+
+
+def is_safe(name: str, args: dict) -> bool:
+    """Auto-allow read-only tools and a small whitelist of read-only commands."""
+    if name in SAFE_TOOLS:
+        return True
+    if name == "run_command":
+        return _is_safe_command(args.get("command", ""))
+    return False
+
+
+def _is_safe_command(cmd: str) -> bool:
+    cmd = cmd.strip()
+    if not cmd:
+        return False
+    for pat in DANGEROUS_PATTERNS:
+        if re.search(pat, cmd):
+            return False
+    return any(
+        cmd == p or cmd.startswith(p + " ")
+        for p in SAFE_COMMAND_PREFIXES
+    )
+
+
 def execute_tool(name: str, args: dict) -> str:
     if name == "run_command":
         return _run_command(args["command"])
@@ -54,6 +103,10 @@ def execute_tool(name: str, args: dict) -> str:
         return _outline(args["path"])
     elif name == "grep":
         return _grep(args["pattern"], args["path"])
+    elif name == "edit_file":
+        return _edit_file(args["path"], args["old"], args["new"])
+    elif name == "write_file":
+        return _write_file(args["path"], args["content"])
     return f"Unknown tool: {name}"
 
 
@@ -125,6 +178,42 @@ def _outline(path: str) -> str:
                 if isinstance(t, ast.Name) and t.id.isupper():
                     out.append(f"L{node.lineno}: {t.id} = ...")
     return "\n".join(out) if out else "(empty)"
+
+
+def _edit_file(path: str, old: str, new: str) -> str:
+    try:
+        with open(path) as f:
+            content = f.read()
+    except Exception as e:
+        return f"[error: {e}]"
+    count = content.count(old)
+    if count == 0:
+        return (
+            f"[error: `old` string not found in {path}. "
+            f"Do NOT guess again — call read_file on the relevant lines first, "
+            f"then retry edit_file with the literal content you read.]"
+        )
+    if count > 1:
+        return (
+            f"[error: `old` matches {count} times in {path}. "
+            f"Add surrounding lines to `old` (and matching context to `new`) "
+            f"until it occurs exactly once.]"
+        )
+    try:
+        with open(path, "w") as f:
+            f.write(content.replace(old, new, 1))
+    except Exception as e:
+        return f"[error: {e}]"
+    return f"Edited {path} (1 replacement)."
+
+
+def _write_file(path: str, content: str) -> str:
+    try:
+        with open(path, "w") as f:
+            n = f.write(content)
+    except Exception as e:
+        return f"[error: {e}]"
+    return f"Wrote {n} bytes to {path}."
 
 
 def _grep(pattern: str, path: str) -> str:
