@@ -11,6 +11,7 @@ from config import (
     BACKEND, OLLAMA_HOST, OPENAI_BASE_URL, OPENAI_API_KEY,
     MODEL, NUM_CTX, SYSTEM_PROMPT,
 )
+from tools import TOOL_DEFINITIONS
 
 
 if BACKEND == "openai":
@@ -21,21 +22,102 @@ else:
     client = Client(host=OLLAMA_HOST)
 
 
-def _openai_to_ollama(stream):
-    """Adapt OpenAI streaming chunks into the ollama chunk shape that stream_response expects."""
-    for chunk in stream:
-        out = {"message": {"content": ""}}
-        if chunk.choices:
-            delta = chunk.choices[0].delta
-            out["message"]["content"] = delta.content or ""
-            if chunk.choices[0].finish_reason:
-                out["done"] = True
+def _stream_openai_native(raw_stream):
+    """Stream OpenAI/vLLM chunks with native tool calling.
+
+    Yields the same event shape that the ollama path emits: text / thinking /
+    thinking_end / tool_call / stats / assistant_raw / done.
+
+    Tool-call fragments arrive across many chunks keyed by `index`: function.name
+    comes once, function.arguments is a JSON string accumulated over chunks.
+    """
+    raw = ""
+    pending = ""    # text-state accumulator (for <think> splitting)
+    think_buf = ""  # partial </think> hold
+    state = "text"
+    tool_frags = {}  # index -> {"name": str, "arguments": str}
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    for chunk in raw_stream:
         usage = getattr(chunk, "usage", None)
         if usage:
-            out["done"] = True
-            out["prompt_eval_count"] = usage.prompt_tokens
-            out["eval_count"] = usage.completion_tokens
-        yield out
+            prompt_tokens = usage.prompt_tokens
+            completion_tokens = usage.completion_tokens
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+
+        if getattr(delta, "tool_calls", None):
+            for tc in delta.tool_calls:
+                slot = tool_frags.setdefault(tc.index, {"name": "", "arguments": ""})
+                if tc.function:
+                    if tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+
+        content = delta.content or ""
+        if content:
+            raw += content
+            cursor = content
+            while cursor:
+                if state == "think":
+                    combined = think_buf + cursor
+                    end = combined.find(THINK_CLOSE)
+                    if end == -1:
+                        safe, hold = _safe_split_multi(combined, [THINK_CLOSE])
+                        if safe:
+                            yield {"type": "thinking", "content": safe}
+                        think_buf = hold
+                        cursor = ""
+                    else:
+                        if end > 0:
+                            yield {"type": "thinking", "content": combined[:end]}
+                        yield {"type": "thinking_end"}
+                        cursor = combined[end + len(THINK_CLOSE):]
+                        think_buf = ""
+                        state = "text"
+                else:
+                    pending += cursor
+                    cursor = ""
+                    idx = pending.find(THINK_OPEN)
+                    if idx == -1:
+                        safe, hold = _safe_split_multi(pending, [THINK_OPEN])
+                        if safe:
+                            yield {"type": "text", "content": safe}
+                        pending = hold
+                    else:
+                        if idx > 0:
+                            yield {"type": "text", "content": pending[:idx]}
+                        cursor = pending[idx + len(THINK_OPEN):]
+                        pending = ""
+                        state = "think"
+
+    if pending:
+        yield {"type": "text", "content": pending}
+    if state == "think":
+        if think_buf:
+            yield {"type": "thinking", "content": think_buf}
+        yield {"type": "thinking_end"}
+
+    for idx in sorted(tool_frags):
+        frag = tool_frags[idx]
+        try:
+            args = json.loads(frag["arguments"]) if frag["arguments"] else {}
+        except json.JSONDecodeError as e:
+            yield {"type": "text", "content": f"\n[bad tool_call JSON: {e}]\n"}
+            continue
+        yield {"type": "tool_call", "name": frag["name"], "args": args}
+
+    if prompt_tokens or completion_tokens:
+        yield {
+            "type": "stats",
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+        }
+    yield {"type": "assistant_raw", "content": raw}
+    yield {"type": "done"}
 
 
 def _ollama_alive(host: str, timeout: float = 0.5) -> bool:
@@ -151,23 +233,31 @@ def stream_response(messages: list, model: str = MODEL):
     """
     full_messages = [{"role": "system", "content": SYSTEM_PROMPT}] + messages
 
-    try:
-        if BACKEND == "openai":
+    if BACKEND == "openai":
+        try:
             raw_stream = client.chat.completions.create(
                 model=model,
                 messages=full_messages,
+                tools=TOOL_DEFINITIONS,
                 stream=True,
                 stream_options={"include_usage": True},
                 max_tokens=4096,
             )
-            stream = _openai_to_ollama(raw_stream)
-        else:
-            stream = client.chat(
-                model=model,
-                messages=full_messages,
-                stream=True,
-                options={"num_ctx": NUM_CTX},
-            )
+        except Exception as e:
+            yield {"type": "text", "content": f"[Connection error: {e}]"}
+            yield {"type": "assistant_raw", "content": ""}
+            yield {"type": "done"}
+            return
+        yield from _stream_openai_native(raw_stream)
+        return
+
+    try:
+        stream = client.chat(
+            model=model,
+            messages=full_messages,
+            stream=True,
+            options={"num_ctx": NUM_CTX},
+        )
     except Exception as e:
         yield {"type": "text", "content": f"[Connection error: {e}]"}
         yield {"type": "assistant_raw", "content": ""}

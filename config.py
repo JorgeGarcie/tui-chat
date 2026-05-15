@@ -8,6 +8,28 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "dummy")
 MODEL = os.environ.get("TUI_MODEL", "qwen2.5-coder:32b")
 NUM_CTX = int(os.environ.get("TUI_NUM_CTX", "16384"))
 
+# Backend-specific tool-call format instructions. With BACKEND=openai we pass a
+# `tools=` schema to vLLM and use native tool_calls — so we must explicitly tell
+# the model NOT to emit the fenced-JSON form, or it copies the example.
+if BACKEND == "openai":
+    _TOOL_FORMAT_BLOCK = (
+        "To call a tool, use the platform's native tool-calling API "
+        "(the runtime exposes the tool schemas to you). "
+        "Do NOT emit fenced JSON tool calls in your message body."
+    )
+else:
+    _TOOL_FORMAT_BLOCK = """To call a tool, emit a fenced JSON block tagged `tool_call`. The fence is REQUIRED.
+
+Correct:
+```tool_call
+{"name": "run_command", "arguments": {"command": "ls -la"}}
+```
+
+Wrong (no fence — do NOT do this):
+{"name": "run_command", "arguments": {"command": "ls -la"}}
+
+After emitting a ```tool_call ... ``` block, STOP and wait. The user will confirm, run it, and feed the result back in a ```tool_result``` block."""
+
 SYSTEM_PROMPT = f"""You are a coding assistant running locally on the user's machine.
 You are running on {platform.system()} {platform.machine()}.
 Current working directory: {os.getcwd()}
@@ -55,17 +77,7 @@ If you haven't seen the relevant lines, your first tool call must be `read_file`
 
 When `edit_file` returns an error, do NOT retry with another guess. Call `read_file` on the relevant lines and use the actual content as `old`.
 
-To call a tool, emit a fenced JSON block tagged `tool_call`. The fence is REQUIRED.
-
-Correct:
-```tool_call
-{{"name": "run_command", "arguments": {{"command": "ls -la"}}}}
-```
-
-Wrong (no fence — do NOT do this):
-{{"name": "run_command", "arguments": {{"command": "ls -la"}}}}
-
-After emitting a ```tool_call ... ``` block, STOP and wait. The user will confirm, run it, and feed the result back in a ```tool_result``` block.
+{_TOOL_FORMAT_BLOCK}
 
 # When to use tools
 
